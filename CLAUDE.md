@@ -34,6 +34,8 @@ src/
 - **Plan** comes from `~/.claude/.credentials.json` (`claudeAiOauth.subscriptionType`) — no API call needed.
 - **Billing period** is derived from the `created_at` field of `claude.ai/api/account`. The day-of-month of `created_at` is treated as the monthly billing day.
 - **Session data** lives in `~/.claude/projects/{encoded-path}/{sessionId}.jsonl`. The directory encoding replaces `/` with `-` (e.g. `-home-akhil-code-myproject`). Sessions are filtered by the first top-level `timestamp` in the JSONL relative to billing period start.
+- **Working directory** comes from the first top-level `cwd` field in the JSONL, not from decoding the directory name — that encoding is lossy for paths containing `-` (e.g. `jnana-bharathi`). Later lines can carry a different `cwd` if the agent `cd`'d mid-session, so only the first is used. Stub sessions with no turns have no `cwd`, but they also have no usage and are skipped.
+- **Resume**: `Enter` in the detail panel tears down the TUI and runs `claude --resume <sessionId>` with `current_dir` set to the session's `cwd`.
 - **Authentication**: `claude.ai/api/account` requires a browser `sessionKey` cookie, not the OAuth access token from `.credentials.json`. The OAuth token only works for inference endpoints on `api.anthropic.com`. On 401/403, the tool prompts for a new sessionKey and overwrites the saved one.
 - **Context utilization** = `input_tokens + cache_creation_input_tokens + cache_read_input_tokens` for the turn with the highest total, divided by the model's context limit (200k for all current models, 100k for claude-2/instant).
 - **Cache efficiency** = `cache_read / (cache_read + cache_creation) × 100` per model per session.
@@ -67,7 +69,7 @@ Total: $1.23                  Input: 107  Output: 50625
 The UI has two focus modes tracked by the `Focus` enum in `ui.rs`: `Calendar` (default) and `Detail`.
 
 - Calendar focus: `←`/`h`, `→`/`l` move ±1 day; `↑`/`k`, `↓`/`j` move ±7 days; `Enter` shifts focus to Detail; `Esc`/`q` quit.
-- Detail focus: `Tab` cycles content; `Esc` returns to Calendar; `q` quits.
+- Detail focus: `↑`/`k`, `↓`/`j` select a session; `Enter` resumes the selected session; `Esc` returns to Calendar; `q` quits.
 - Navigation bounds: `nav_start` = first day of the month containing `billing_start`; `nav_end` = end of the Sunday-terminated week containing `last_valid_day`, capped at month end.
 - Active day initialises to today, clamped to `[billing_start, last_valid_day]`.
 - Active-day calendar highlight is **cyan** when Calendar is focused, **blue** when Detail is focused.

@@ -56,6 +56,11 @@ fn parse_session(
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
 
+    // Working directory the session was launched from. Recorded on every
+    // message line; the first one is the launch dir (later lines can differ
+    // if the agent cd'd into a subdirectory mid-session).
+    let mut cwd: Option<String> = None;
+
     // Scan lines until we find one with a top-level "timestamp" field.
     // Early lines like "permission-mode" and "file-history-snapshot" don't have it.
     let started_at = loop {
@@ -68,6 +73,11 @@ fn parse_session(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+                if cwd.is_none()
+                    && let Some(c) = v.get("cwd").and_then(|c| c.as_str())
+                {
+                    cwd = Some(c.to_string());
+                }
                 let ts = match v.get("timestamp").and_then(|t| t.as_str()) {
                     Some(ts) if ts.len() >= 10 => ts.to_string(),
                     _ => continue,
@@ -102,6 +112,12 @@ fn parse_session(
             && ts.len() >= 10
         {
             last_ts = ts.to_string();
+        }
+
+        if cwd.is_none()
+            && let Some(c) = v.get("cwd").and_then(|c| c.as_str())
+        {
+            cwd = Some(c.to_string());
         }
 
         if v.get("type").and_then(|t| t.as_str()) == Some("ai-title")
@@ -180,6 +196,10 @@ fn parse_session(
 
     models.sort_by_key(|m| std::cmp::Reverse(m.input_tokens));
 
+    // The directory name encoding is lossy (a '-' in a path segment is
+    // indistinguishable from a separator), so prefer the recorded cwd.
+    let project = cwd.clone().unwrap_or(project);
+
     let duration_mins = parse_duration_mins(&started_at, &last_ts);
     let context_limit = model_context_limit(&peak_context_model);
     let peak_context_pct = (peak_context as f64 / context_limit as f64 * 1000.0).round() / 10.0;
@@ -190,6 +210,7 @@ fn parse_session(
         ended_at: last_ts,
         duration_mins,
         project,
+        cwd,
         total_input_tokens: total_input,
         total_output_tokens: total_output,
         peak_context_tokens: peak_context,
