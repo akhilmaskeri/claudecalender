@@ -41,6 +41,9 @@ pub struct SessionStats {
     pub ended_at: String,
     pub duration_mins: f64,
     pub project: String,
+    /// Working directory the session was launched from, read from the `cwd`
+    /// field in the JSONL. `None` for stub sessions that never recorded a turn.
+    pub cwd: Option<String>,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub peak_context_tokens: u64,

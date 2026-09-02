@@ -18,6 +18,12 @@ use ratatui::{
 };
 use crate::{api, models::{Output, SessionStats, UsageData}};
 
+/// A session the user asked to resume: `claude --resume <id>` run from `cwd`.
+struct ResumeRequest {
+    session_id: String,
+    cwd: String,
+}
+
 #[derive(PartialEq)]
 enum Focus {
     Calendar,
@@ -41,6 +47,7 @@ struct App {
     session_key: String,
     selected_session: usize,
     detail_scroll: std::cell::Cell<u16>,
+    status: Option<String>,
 }
 
 impl App {
@@ -85,6 +92,7 @@ impl App {
             session_key: output.session_key,
             selected_session: 0,
             detail_scroll: std::cell::Cell::new(0),
+            status: None,
         })
     }
 
@@ -139,6 +147,24 @@ impl App {
     fn detail_prev(&mut self) {
         self.selected_session = self.selected_session.saturating_sub(1);
     }
+
+    // Err carries a message to show the user instead of resuming.
+    fn resume_target(&self) -> Result<ResumeRequest, String> {
+        let day_sessions = self.sessions_for_day(self.active_day);
+        let Some(s) = day_sessions.get(self.selected_session) else {
+            return Err("No session to resume.".to_string());
+        };
+        let Some(cwd) = s.cwd.as_deref() else {
+            return Err("No working directory recorded for this session.".to_string());
+        };
+        if !std::path::Path::new(cwd).is_dir() {
+            return Err(format!("Working directory no longer exists: {cwd}"));
+        }
+        Ok(ResumeRequest {
+            session_id: s.session_id.clone(),
+            cwd: cwd.to_string(),
+        })
+    }
 }
 
 pub fn run_app(output: Output) -> Result<()> {
@@ -155,13 +181,33 @@ pub fn run_app(output: Output) -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
-    result
+
+    match result? {
+        Some(req) => resume_session(req),
+        None => Ok(()),
+    }
+}
+
+// Hands the terminal over to `claude --resume` in the session's working
+// directory. Called only after the TUI has been torn down.
+fn resume_session(req: ResumeRequest) -> Result<()> {
+    let status = std::process::Command::new("claude")
+        .arg("--resume")
+        .arg(&req.session_id)
+        .current_dir(&req.cwd)
+        .status()
+        .map_err(|e| anyhow::anyhow!("could not run `claude`: {e}"))?;
+
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
 }
 
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-) -> Result<()> {
+) -> Result<Option<ResumeRequest>> {
     let usage_bg = Arc::clone(&app.usage);
     let key_bg = app.session_key.clone();
     let uuid_bg = app.org_uuid.clone();
@@ -181,10 +227,16 @@ fn run_loop(
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
+            app.status = None;
+
             match (key.code, &app.focus) {
-                (KeyCode::Char('q'), _) => return Ok(()),
+                (KeyCode::Char('q'), _) => return Ok(None),
                 (KeyCode::Esc, Focus::Detail) => app.focus = Focus::Calendar,
-                (KeyCode::Esc, Focus::Calendar) => return Ok(()),
+                (KeyCode::Esc, Focus::Calendar) => return Ok(None),
+                (KeyCode::Enter, Focus::Detail) => match app.resume_target() {
+                    Ok(req) => return Ok(Some(req)),
+                    Err(msg) => app.status = Some(msg),
+                },
                 (KeyCode::Enter, Focus::Calendar) => {
                     app.selected_session = 0;
                     app.detail_scroll.set(0);
@@ -385,6 +437,18 @@ fn draw_calendar(f: &mut ratatui::Frame, app: &App, area: Rect) {
 // ── Session panel ──────────────────────────────────────────────────────────────
 
 fn draw_sessions(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    // Reserve a footer line for a status message when there is one.
+    let (area, footer) = match app.status {
+        Some(_) => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Fill(1), Constraint::Length(1)])
+                .split(area);
+            (rows[0], Some(rows[1]))
+        }
+        None => (area, None),
+    };
+
     let day_sessions = app.sessions_for_day(app.active_day);
     // 2 cols left padding; cap summary at 80 chars
     let inner_width = area.width.saturating_sub(2) as usize;
@@ -444,6 +508,17 @@ fn draw_sessions(f: &mut ratatui::Frame, app: &App, area: Rect) {
         .scroll((app.detail_scroll.get(), 0))
         .wrap(Wrap { trim: false });
     f.render_widget(widget, area);
+
+    if let (Some(rect), Some(msg)) = (footer, &app.status) {
+        let line = Line::from(Span::styled(
+            msg.clone(),
+            Style::default().fg(Color::Red),
+        ));
+        f.render_widget(
+            Paragraph::new(line).block(Block::default().padding(Padding::new(2, 0, 0, 0))),
+            rect,
+        );
+    }
 }
 
 fn fmt_time(ts: &str) -> &str {
