@@ -18,7 +18,7 @@ fn main() -> Result<()> {
     })?;
 
     let period = api::billing_period(&body)?;
-    let session_stats = sessions::scan_sessions(&period.start)?;
+    let session_stats = sessions::scan_sessions()?;
 
     let org_uuid = api::fetch_org_uuid(&session_key).unwrap_or_default();
     let initial_usage = api::fetch_usage(&session_key, &org_uuid).ok();

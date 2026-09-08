@@ -2,10 +2,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use anyhow::Result;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use crate::models::{ModelUsage, SessionStats};
 
-pub fn scan_sessions(since: &NaiveDate) -> Result<Vec<SessionStats>> {
+/// Scans all locally recorded sessions, regardless of billing period. The UI
+/// is responsible for slicing this by month/period when browsing history.
+pub fn scan_sessions() -> Result<Vec<SessionStats>> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
     let projects_dir = home.join(".claude").join("projects");
 
@@ -34,7 +36,7 @@ pub fn scan_sessions(since: &NaiveDate) -> Result<Vec<SessionStats>> {
 
             let session_id = fname.trim_end_matches(".jsonl").to_string();
 
-            match parse_session(file_entry.path(), since, session_id, project_path.clone()) {
+            match parse_session(file_entry.path(), session_id, project_path.clone()) {
                 Ok(Some(stats)) => sessions.push(stats),
                 Ok(None) => {}
                 Err(e) => eprintln!("Warning: skipping {:?}: {e}", file_entry.path()),
@@ -48,7 +50,6 @@ pub fn scan_sessions(since: &NaiveDate) -> Result<Vec<SessionStats>> {
 
 fn parse_session(
     path: std::path::PathBuf,
-    since: &NaiveDate,
     session_id: String,
     project: String,
 ) -> Result<Option<SessionStats>> {
@@ -82,10 +83,6 @@ fn parse_session(
                     Some(ts) if ts.len() >= 10 => ts.to_string(),
                     _ => continue,
                 };
-                let date = NaiveDate::parse_from_str(&ts[..10], "%Y-%m-%d")?;
-                if date < *since {
-                    return Ok(None);
-                }
                 break ts;
             }
         }

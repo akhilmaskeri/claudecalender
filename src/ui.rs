@@ -6,7 +6,9 @@ use chrono::{DateTime, Datelike, Duration, Local, NaiveDate};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
+    },
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -39,7 +41,15 @@ struct App {
     daily_tokens: HashMap<NaiveDate, u64>,
     max_daily_tokens: u64,
     daily_costs: HashMap<NaiveDate, f64>,
-    period_cost: f64,
+    /// First-of-month of the calendar month currently displayed. Defaults to
+    /// the month containing the active billing period; `[`/`]` walk it back
+    /// through months that have local session history, or forward again.
+    view_month: NaiveDate,
+    /// First-of-month of the active billing period — the newest month
+    /// reachable, and the one that still gets billing-period highlighting.
+    current_period_month: NaiveDate,
+    /// First-of-month of the oldest month with any locally recorded session.
+    min_view_month: NaiveDate,
     focus: Focus,
     plan: String,
     usage: Arc<Mutex<Option<UsageData>>>,
@@ -59,10 +69,11 @@ impl App {
         let today = Local::now().date_naive();
         let last_valid = billing_end - Duration::days(1);
         let active_day = today.max(billing_start).min(last_valid);
+        let current_period_month = billing_start.with_day(1).unwrap();
 
         let mut daily_tokens: HashMap<NaiveDate, u64> = HashMap::new();
         let mut daily_costs: HashMap<NaiveDate, f64> = HashMap::new();
-        let mut period_cost = 0f64;
+        let mut earliest: Option<NaiveDate> = None;
         for s in &output.sessions {
             if s.started_at.len() >= 10
                 && let Ok(d) = NaiveDate::parse_from_str(&s.started_at[..10], "%Y-%m-%d")
@@ -70,10 +81,14 @@ impl App {
                 *daily_tokens.entry(d).or_insert(0) +=
                     s.total_input_tokens + s.total_output_tokens;
                 *daily_costs.entry(d).or_insert(0.0) += s.cost_usd;
-                period_cost += s.cost_usd;
+                earliest = Some(earliest.map_or(d, |e: NaiveDate| e.min(d)));
             }
         }
         let max_daily_tokens = daily_tokens.values().copied().max().unwrap_or(0);
+        let min_view_month = earliest
+            .map(|d| d.with_day(1).unwrap())
+            .unwrap_or(current_period_month)
+            .min(current_period_month);
 
         Ok(App {
             sessions: output.sessions,
@@ -84,7 +99,9 @@ impl App {
             daily_tokens,
             max_daily_tokens,
             daily_costs,
-            period_cost,
+            view_month: current_period_month,
+            current_period_month,
+            min_view_month,
             focus: Focus::Calendar,
             plan: output.plan,
             usage: Arc::new(Mutex::new(output.initial_usage)),
@@ -100,19 +117,84 @@ impl App {
         self.billing_end - Duration::days(1)
     }
 
-    // First displayed day: beginning of the month that contains billing_start.
-    fn nav_start(&self) -> NaiveDate {
-        self.billing_start.with_day(1).unwrap()
+    fn is_current_view(&self) -> bool {
+        self.view_month == self.current_period_month
     }
 
-    // Last displayed day: end of the week (Sunday) that contains last_valid_day,
-    // capped at the end of that month so we never spill into a third month.
+    // First displayed day: beginning of the displayed month.
+    fn nav_start(&self) -> NaiveDate {
+        self.view_month
+    }
+
+    // Last displayed day. For the current billing period this is the end of
+    // the week (Sunday) that contains last_valid_day, capped at month end so
+    // we never spill into a third month. For a browsed-back history month
+    // it's simply the last day of that month.
     fn nav_end(&self) -> NaiveDate {
-        let last = self.last_valid_day();
-        let days_to_sun = 6 - last.weekday().num_days_from_monday() as i64;
-        let end = last + Duration::days(days_to_sun);
-        let month_end = last.with_day(month_days(last.year(), last.month())).unwrap();
-        end.min(month_end)
+        if self.is_current_view() {
+            let last = self.last_valid_day();
+            let days_to_sun = 6 - last.weekday().num_days_from_monday() as i64;
+            let end = last + Duration::days(days_to_sun);
+            let month_end = last.with_day(month_days(last.year(), last.month())).unwrap();
+            end.min(month_end)
+        } else {
+            self.view_month
+                .with_day(month_days(self.view_month.year(), self.view_month.month()))
+                .unwrap()
+        }
+    }
+
+    fn can_go_prev_month(&self) -> bool {
+        self.view_month > self.min_view_month
+    }
+
+    fn can_go_next_month(&self) -> bool {
+        self.view_month < self.current_period_month
+    }
+
+    fn goto_month(&mut self, month: NaiveDate) {
+        self.view_month = month;
+        if self.is_current_view() {
+            self.active_day = self.today.max(self.nav_start()).min(self.last_valid_day());
+        } else {
+            let month_end = month.with_day(month_days(month.year(), month.month())).unwrap();
+            // Default to the most recent day with recorded usage in this month.
+            self.active_day = self
+                .daily_tokens
+                .keys()
+                .filter(|d| **d >= month && **d <= month_end)
+                .max()
+                .copied()
+                .unwrap_or(month);
+        }
+        self.selected_session = 0;
+        self.detail_scroll.set(0);
+    }
+
+    fn prev_month(&mut self) {
+        if !self.can_go_prev_month() {
+            return;
+        }
+        let m = self.view_month;
+        let prev = if m.month() == 1 {
+            NaiveDate::from_ymd_opt(m.year() - 1, 12, 1).unwrap()
+        } else {
+            NaiveDate::from_ymd_opt(m.year(), m.month() - 1, 1).unwrap()
+        };
+        self.goto_month(prev.max(self.min_view_month));
+    }
+
+    fn next_month(&mut self) {
+        if !self.can_go_next_month() {
+            return;
+        }
+        let m = self.view_month;
+        let next = if m.month() == 12 {
+            NaiveDate::from_ymd_opt(m.year() + 1, 1, 1).unwrap()
+        } else {
+            NaiveDate::from_ymd_opt(m.year(), m.month() + 1, 1).unwrap()
+        };
+        self.goto_month(next.min(self.current_period_month));
     }
 
     fn sessions_for_day(&self, day: NaiveDate) -> Vec<&SessionStats> {
@@ -172,7 +254,7 @@ pub fn run_app(output: Output) -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, SetTitle("ClaudeCalendar"))?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -248,6 +330,9 @@ fn run_loop(
                 (KeyCode::Up | KeyCode::Char('k'), Focus::Calendar) => app.move_active_day(-7),
                 (KeyCode::Down | KeyCode::Char('j'), Focus::Calendar) => app.move_active_day(7),
 
+                (KeyCode::Char('[') | KeyCode::PageUp, Focus::Calendar) => app.prev_month(),
+                (KeyCode::Char(']') | KeyCode::PageDown, Focus::Calendar) => app.next_month(),
+
                 (KeyCode::Up | KeyCode::Char('k'), Focus::Detail) => app.detail_prev(),
                 (KeyCode::Down | KeyCode::Char('j'), Focus::Detail) => app.detail_next(),
                 _ => {}
@@ -259,9 +344,16 @@ fn run_loop(
 fn draw(f: &mut ratatui::Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(20), Constraint::Fill(1)])
+        .constraints([Constraint::Length(24), Constraint::Fill(1)])
         .split(f.area());
-    draw_calendar(f, app, chunks[0]);
+
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(9), Constraint::Fill(1)])
+        .split(chunks[0]);
+
+    draw_calendar(f, app, left[0]);
+    draw_usage(f, app, left[1]);
     draw_sessions(f, app, chunks[1]);
 }
 
@@ -286,19 +378,29 @@ fn contribution_color(level: u8) -> Color {
 }
 
 fn day_style(app: &App, date: NaiveDate) -> Style {
-    let last_valid = app.last_valid_day();
-    let in_period = date >= app.billing_start && date <= last_valid;
-    let is_overflow = date.year() != app.billing_start.year()
-        || date.month() != app.billing_start.month();
-
     if date == app.active_day {
         let bg = if app.focus == Focus::Calendar { Color::Cyan } else { Color::Blue };
         return Style::default().bg(bg).fg(Color::White).add_modifier(Modifier::BOLD);
     }
-    if !in_period {
-        return Style::default().fg(Color::DarkGray);
+
+    // Billing-period and overflow-month distinctions only apply while
+    // viewing the current period; browsed-back history months are shown as
+    // plain calendar months.
+    if app.is_current_view() {
+        let last_valid = app.last_valid_day();
+        let in_period = date >= app.billing_start && date <= last_valid;
+        let is_overflow = date.year() != app.billing_start.year()
+            || date.month() != app.billing_start.month();
+        if !in_period {
+            return Style::default().fg(Color::DarkGray);
+        }
+        return day_usage_style(app, date, is_overflow);
     }
 
+    day_usage_style(app, date, false)
+}
+
+fn day_usage_style(app: &App, date: NaiveDate, is_overflow: bool) -> Style {
     let tokens = app.daily_tokens.get(&date).copied().unwrap_or(0);
     if tokens > 0 {
         let level = ((tokens * 4).saturating_sub(1) / app.max_daily_tokens).min(3) as u8 + 1;
@@ -350,21 +452,22 @@ fn fmt_resets_on(ts: &str) -> String {
 }
 
 fn draw_calendar(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let month_start = app.view_month;
+    let total_end = app.nav_end();
+
+    let title = Span::styled(
+        format!("[ {} ]", month_start.format("%B %Y")),
+        Style::default().add_modifier(Modifier::BOLD),
+    );
+    let block = Block::bordered()
+        .title(Line::from(title))
+        .padding(Padding::new(1, 1, 1, 1));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    let sy = app.billing_start.year();
-    let sm = app.billing_start.month();
-    let month_start = NaiveDate::from_ymd_opt(sy, sm, 1).unwrap();
-
     lines.push(Line::from("Mo Tu We Th Fr Sa Su"));
-
-    let last = app.last_valid_day();
-    let days_to_sun = 6 - last.weekday().num_days_from_monday() as i64;
-    let total_end = {
-        let end = last + Duration::days(days_to_sun);
-        let month_end = last.with_day(month_days(last.year(), last.month())).unwrap();
-        end.min(month_end)
-    };
 
     let first_wd = month_start.weekday().num_days_from_monday() as usize;
     let mut col = 0usize;
@@ -397,12 +500,33 @@ fn draw_calendar(f: &mut ratatui::Frame, app: &App, area: Rect) {
         lines.push(Line::from(spans));
     }
 
-    lines.push(Line::from(""));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+// ── Usage panel ─────────────────────────────────────────────────────────────────
+
+fn draw_usage(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let block = Block::bordered()
+        .title("[ Usage ]")
+        .padding(Padding::new(1, 1, 1, 1));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let month_start = app.view_month;
+    let total_end = app.nav_end();
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
 
     let plan_label = fmt_plan(&app.plan);
     let day_cost = app.daily_costs.get(&app.active_day).copied().unwrap_or(0.0);
+    let mut range_cost = 0f64;
+    let mut d = month_start;
+    while d <= total_end {
+        range_cost += app.daily_costs.get(&d).copied().unwrap_or(0.0);
+        d += Duration::days(1);
+    }
     lines.push(Line::from(Span::styled(
-        format!("{:<4} ${:.2} ${:.2}", plan_label, app.period_cost, day_cost),
+        format!("{:<4} ${:.2} ${:.2}", plan_label, range_cost, day_cost),
         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
     )));
 
@@ -431,12 +555,17 @@ fn draw_calendar(f: &mut ratatui::Frame, app: &App, area: Rect) {
     }
     drop(usage_guard);
 
-    f.render_widget(Paragraph::new(lines), area);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 // ── Session panel ──────────────────────────────────────────────────────────────
 
 fn draw_sessions(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let block = Block::bordered().title("[ Sessions ]");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let area = inner;
+
     // Reserve a footer line for a status message when there is one.
     let (area, footer) = match app.status {
         Some(_) => {
