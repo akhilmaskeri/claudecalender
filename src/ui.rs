@@ -461,7 +461,7 @@ fn draw_calendar(f: &mut ratatui::Frame, app: &App, area: Rect) {
     );
     let block = Block::bordered()
         .title(Line::from(title))
-        .padding(Padding::new(1, 1, 1, 1));
+        .padding(Padding::new(1, 1, 0, 0));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -512,8 +512,12 @@ fn draw_usage(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let month_start = app.view_month;
-    let total_end = app.nav_end();
+    // Current view: sum only this billing cycle. History months: whole month.
+    let (month_start, total_end) = if app.is_current_view() {
+        (app.billing_start, app.last_valid_day())
+    } else {
+        (app.view_month, app.nav_end())
+    };
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
